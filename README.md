@@ -50,13 +50,27 @@
 
 ## 安装
 
+**方式 A — 下载 Release 包（推荐）**：到 [Releases](https://github.com/Wh1teJ0ker/zc-trace-helper/releases) 下载最新 `zc-trace-helper-vX.Y.Z.zip`（校验和见包内同级 `checksums.txt`），解压得到扩展目录。
+
+**方式 B — 源码加载**：clone 或下载本仓库源码。
+
+加载步骤：
+
 1. 打开 Chrome，访问 `chrome://extensions/`。
 2. 右上角开启「开发者模式」。
-3. 「加载已解压的扩展程序」→ 选择本目录（`zc-trace-helper/`）。
+3. 「加载已解压的扩展程序」→ 选择扩展目录（Release 包解压后即为扩展目录；源码方式选仓库根目录）。
 4. 打开漏洞提交页 `https://zc.tencent.com/vuln/whiteHat/vulnSubmit?project_code=...`，点击工具栏插件图标，右侧弹出侧边栏。
 5. 首次使用：点「抓取全部」→ 等待索引完成 → 搜索/查看 → 勾选 → 一键填入。
 
 > 版本升级后若提示索引结构变更，点一次「重建索引」即可（会话列表无需重抓）。
+
+## 发布流程（维护者）
+
+1. 更新 `manifest.json` 的 `version` 字段。
+2. 运行 `./release.sh <版本号>`（与 manifest 一致性自动校验）——提交改动、打 `vX.Y.Z` tag 并推送。
+3. GitHub Actions 自动：校验 tag 与 manifest 一致 → 打包扩展 zip（排除开发文件）→ 生成 SHA256 校验和 → 创建 GitHub Release 并附上产物。
+
+CI 配置见 `.github/workflows/release.yml`。
 
 ## 使用技巧
 
@@ -74,6 +88,8 @@ zc-trace-helper/
 ├── sidepanel.html    # 侧边栏 UI（含详情查看器弹层）
 ├── sidepanel.js      # 搜索/筛选/排序、分类索引、查看器、填入调度、分键存储
 ├── content.js        # 页面内代理：API 请求（详情分类解析）+ 子步骤表单自动化
+├── release.sh        # 本地发布脚本（提交 + tag + push，CI 接管打包）
+├── .github/workflows/release.yml  # tag 触发的自动 Release CI
 ├── docs/             # 截图
 └── README.md
 ```

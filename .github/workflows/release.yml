@@ -1,0 +1,52 @@
+name: Release
+
+# 推送 v* tag 时自动打包扩展并发布 GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          # 校验 tag 版本与 manifest.json 一致
+          MANIFEST_VER=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
+          if [ "$TAG" != "$MANIFEST_VER" ]; then
+            echo "::error::tag v$TAG 与 manifest.json version $MANIFEST_VER 不一致，请先更新 manifest.json"
+            exit 1
+          fi
+
+      - name: Package extension zip
+        run: |
+          mkdir -p dist
+          # 打包内容 = manifest + js + html + docs(截图，README 引用)，排除 CI/开发文件
+          zip -r "dist/zc-trace-helper-v${{ steps.ver.outputs.version }}.zip" \
+            manifest.json background.js content.js sidepanel.html sidepanel.js README.md docs \
+            -x '*.DS_Store' -x 'docs/.DS_Store'
+
+      - name: Checksum
+        working-directory: dist
+        run: |
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: zc-trace-helper v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/checksums.txt
