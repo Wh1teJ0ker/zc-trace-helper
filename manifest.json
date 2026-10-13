@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "ZC 会话追踪助手",
+  "version": "1.0.0",
+  "description": "腾讯安全众测平台辅助插件：在漏洞提交页通过侧边栏搜索 AI 网关会话日志，勾选后一键填入 AI 参与申报的子步骤。",
+  "permissions": ["sidePanel", "storage", "unlimitedStorage"],
+  "host_permissions": ["https://zc.tencent.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://zc.tencent.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "打开会话追踪助手"
+  },
+  "icons": {}
+}

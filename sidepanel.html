@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>会话追踪助手</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --bg-glow: radial-gradient(1200px 500px at 50% -10%, rgba(79,142,247,.13), transparent 60%);
+      --panel: rgba(22,28,38,.85);
+      --panel2: #1a2331;
+      --panel3: #212d3e;
+      --border: rgba(94,120,155,.22);
+      --border-hi: rgba(79,142,247,.55);
+      --text: #dbe5f1;
+      --text-dim: #94a5ba;
+      --muted: #6c7f95;
+      --accent: #4f8ef7;
+      --accent2: #2f6fe0;
+      --cyan: #37d6c0;
+      --green: #3ecf7a;
+      --amber: #ffb454;
+      --red: #ef6a6a;
+      --chip: #22304399;
+      --radius: 10px;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-thumb { background: #2b3a4f; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a4d68; }
+    ::-webkit-scrollbar-track { background: transparent; }
+
+    body {
+      width: 100%;
+      min-width: 300px;
+      background: var(--bg);
+      background-image: var(--bg-glow);
+      color: var(--text);
+      font: 13px/1.55 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ---------- header ---------- */
+    header {
+      padding: 12px 14px 10px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(30,42,60,.9), rgba(18,25,36,.9));
+      backdrop-filter: blur(6px);
+    }
+    .brand { display: flex; align-items: center; gap: 8px; }
+    .logo {
+      width: 26px; height: 26px; border-radius: 7px;
+      background: linear-gradient(135deg, var(--accent), var(--cyan));
+      display: grid; place-items: center;
+      box-shadow: 0 0 14px rgba(79,142,247,.45);
+    }
+    .brand h1 { font-size: 14px; font-weight: 700; letter-spacing: .3px; }
+    .brand .sub { color: var(--muted); font-size: 10.5px; margin-top: 1px; }
+
+    .stats { display: flex; gap: 6px; margin-top: 10px; }
+    .stat {
+      flex: 1;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+    .stat b { display: block; font-size: 15px; font-weight: 700; font-family: var(--mono); }
+    .stat span { font-size: 10px; color: var(--muted); }
+    .stat.acc b { color: var(--accent); }
+    .stat.cyan b { color: var(--cyan); }
+    .stat.green b { color: var(--green); }
+
+    .toolbar { display: flex; gap: 6px; margin-top: 10px; }
+    .toolbar button {
+      flex: 1;
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+      background: var(--panel3);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 8px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      transition: all .15s;
+    }
+    .toolbar button:hover { border-color: var(--border-hi); transform: translateY(-1px); }
+    .toolbar button.primary {
+      background: linear-gradient(135deg, var(--accent2), var(--accent));
+      border-color: transparent;
+      color: #fff;
+      box-shadow: 0 2px 10px rgba(47,111,224,.4);
+    }
+    .toolbar button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+    /* ---------- crawl progress ---------- */
+    #crawlBar {
+      display: none;
+      margin: 10px 14px 0;
+      padding: 8px 10px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-hi);
+      background: var(--panel2);
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    #crawlBar .bar {
+      height: 5px;
+      background: var(--chip);
+      border-radius: 3px;
+      margin-top: 6px;
+      overflow: hidden;
+    }
+    #crawlBar .bar i {
+      display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent2), var(--cyan));
+      border-radius: 3px;
+      transition: width .3s;
+      box-shadow: 0 0 8px rgba(79,142,247,.7);
+    }
+
+    /* ---------- connection banner ---------- */
+    #targetBanner {
+      margin: 10px 14px 0;
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 11px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+    }
+    #targetBanner.ok { border-color: rgba(62,207,122,.35); color: var(--green); background: rgba(62,207,122,.06); }
+    #targetBanner.bad { border-color: rgba(239,106,106,.35); color: var(--red); background: rgba(239,106,106,.06); }
+    #targetBanner button {
+      background: none; border: none; color: var(--accent); cursor: pointer; font-size: 11px; white-space: nowrap;
+    }
+
+    /* ---------- search ---------- */
+    .searchwrap { padding: 10px 14px 0; }
+    .searchbar {
+      display: flex; align-items: center; gap: 8px;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0 10px;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .searchbar:focus-within { border-color: var(--border-hi); box-shadow: 0 0 0 3px rgba(79,142,247,.15); }
+    .searchbar .icon { color: var(--muted); display: grid; place-items: center; }
+    .searchbar input {
+      flex: 1;
+      background: transparent;
+      border: none; outline: none;
+      color: var(--text);
+      padding: 8px 0;
+      font-size: 12.5px;
+    }
+    .searchbar input::placeholder { color: var(--muted); }
+    .searchbar .clearkw {
+      display: none;
+      background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px;
+    }
+    .searchbar .clearkw:hover { color: var(--text); }
+
+    /* ---------- filters ---------- */
+    .filterbar {
+      display: flex; gap: 5px; padding: 8px 14px 4px; flex-wrap: wrap; align-items: center;
+    }
+    .fgroup { display: flex; gap: 4px; background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 2px; }
+    .fgroup .chip {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      user-select: none;
+      transition: all .12s;
+    }
+    .fgroup .chip.on {
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent2), var(--accent));
+      box-shadow: 0 1px 6px rgba(47,111,224,.5);
+    }
+    .fgroup .chip:hover:not(.on) { color: var(--text); }
+    select.sortsel {
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      border-radius: 8px;
+      padding: 3px 6px;
+      font-size: 11px;
+      outline: none;
+      cursor: pointer;
+    }
+    .catbar { padding-bottom: 6px; }
+    .catlabel { color: var(--muted); font-size: 11px; flex: none; }
+    .catgroup { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
+    .catchip {
+      display: inline-flex; align-items: center; gap: 5px;
+      background: var(--panel2); border: 1px solid var(--border);
+      color: var(--muted);
+      border-radius: 999px; padding: 3px 10px; font-size: 11px; cursor: pointer;
+      transition: all .12s;
+      user-select: none;
+      min-height: 24px;
+    }
+    .catchip i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+    .catchip:hover { color: var(--text); border-color: var(--border-hi); }
+    .catchip.on {
+      color: #fff;
+      border-color: var(--border-hi);
+      background: rgba(79,142,247,.18);
+      box-shadow: 0 0 0 1px rgba(79,142,247,.3);
+    }
+    .count { color: var(--muted); font-size: 11px; margin-left: auto; font-family: var(--mono); white-space: nowrap; }
+    .count b { color: var(--amber); font-weight: 600; }
+    .hint { color: var(--muted); font-size: 10px; padding: 0 14px 2px; }
+    .hint code { color: var(--cyan); font-family: var(--mono); }
+
+    /* ---------- list ---------- */
+    #list { flex: 1; overflow-y: auto; padding: 2px 14px 14px; }
+    .item {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--panel);
+      padding: 9px 11px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .item:hover { border-color: var(--border-hi); }
+    .item.checked {
+      border-color: var(--accent);
+      background: linear-gradient(180deg, rgba(79,142,247,.10), rgba(79,142,247,.04));
+      box-shadow: 0 0 0 1px rgba(79,142,247,.25), 0 4px 14px rgba(47,111,224,.15);
+    }
+    .item .row1 { display: flex; align-items: center; gap: 7px; }
+    .item .sid {
+      font-family: var(--mono);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: .3px;
+    }
+    .item .time { color: var(--muted); font-size: 10.5px; margin-left: auto; font-family: var(--mono); }
+    .checkbox { width: 15px; height: 15px; flex: none; accent-color: var(--accent); cursor: pointer; }
+    .item .title {
+      color: var(--text-dim);
+      font-size: 11.5px;
+      margin-top: 5px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-all;
+    }
+    .item .excerpt {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 4px;
+      padding: 5px 8px;
+      border-left: 2px solid var(--amber);
+      background: rgba(255,180,84,.06);
+      border-radius: 0 6px 6px 0;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-all;
+    }
+    mark {
+      background: rgba(255,180,84,.3);
+      color: #ffd479;
+      border-radius: 2px;
+      padding: 0 1px;
+      font-weight: 600;
+    }
+    .item .row3 { display: flex; gap: 5px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
+    .tag {
+      font-size: 10px;
+      background: var(--chip);
+      color: var(--text-dim);
+      border-radius: 5px;
+      padding: 1.5px 7px;
+      font-family: var(--mono);
+    }
+    .tag.model { color: var(--cyan); background: rgba(55,214,192,.08); }
+    .tag.hit { color: #1a1206; background: linear-gradient(135deg, #ffd479, #ffb454); font-weight: 700; }
+    .item .actions { display: flex; gap: 6px; margin-top: 7px; }
+    .item .actions button {
+      flex: 1;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4.5px 0;
+      font-size: 11px;
+      cursor: pointer;
+      background: var(--panel3);
+      color: var(--text-dim);
+      transition: all .12s;
+    }
+    .item .actions button:hover { border-color: var(--border-hi); color: #fff; background: rgba(79,142,247,.18); }
+    .item .actions button.danger:hover { border-color: rgba(239,106,106,.6); color: var(--red); background: rgba(239,106,106,.1); }
+
+    .empty {
+      color: var(--muted); text-align: center; padding: 40px 16px; font-size: 12px;
+      border: 1px dashed var(--border); border-radius: var(--radius); margin-top: 8px;
+    }
+    .empty .big-icon { display: block; margin: 0 auto 10px; opacity: .55; }
+
+    /* ---------- footer ---------- */
+    #footbar {
+      padding: 11px 14px;
+      border-top: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(18,25,36,.92), rgba(22,30,44,.96));
+      backdrop-filter: blur(6px);
+    }
+    .stageSel { display: flex; gap: 5px; margin-bottom: 9px; }
+    .stageSel button {
+      flex: 1;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      border-radius: 8px;
+      padding: 5.5px 0;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all .13s;
+    }
+    .stageSel button.on {
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent2), var(--accent));
+      border-color: transparent;
+      box-shadow: 0 2px 8px rgba(47,111,224,.45);
+    }
+    #fillBtn {
+      width: 100%;
+      background: linear-gradient(135deg, var(--accent2), var(--accent));
+      color: #fff;
+      border: none;
+      border-radius: 9px;
+      padding: 10px 0;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .5px;
+      cursor: pointer;
+      box-shadow: 0 3px 14px rgba(47,111,224,.45);
+      transition: all .15s;
+    }
+    #fillBtn:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
+    #fillBtn:not(:disabled):hover { transform: translateY(-1px); box-shadow: 0 5px 18px rgba(47,111,224,.6); }
+    #status {
+      color: var(--muted); font-size: 11px; margin-top: 7px; min-height: 15px;
+      text-align: center; word-break: break-all;
+    }
+    #status.ok { color: var(--green); }
+    #status.err { color: var(--red); }
+    .spin {
+      display: inline-block; width: 12px; height: 12px;
+      border: 2px solid currentColor; border-top-color: transparent;
+      border-radius: 50%; animation: sp .8s linear infinite; vertical-align: -2px;
+    }
+    @keyframes sp { to { transform: rotate(360deg); } }
+
+    /* ---------- viewer ---------- */
+    #viewer {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(5,8,12,.72);
+      backdrop-filter: blur(3px);
+      z-index: 100;
+    }
+    #viewer.open { display: flex; }
+    .viewer-panel {
+      flex: 1;
+      margin: 10px;
+      background: var(--bg);
+      border: 1px solid var(--border-hi);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 10px 50px rgba(0,0,0,.6);
+    }
+    .viewer-head {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel2);
+    }
+    .viewer-head b { font-size: 13px; font-family: var(--mono); }
+    #viewerClose {
+      margin-left: auto;
+      background: var(--panel3); border: 1px solid var(--border); color: var(--text-dim);
+      border-radius: 7px; cursor: pointer; padding: 5px 7px;
+      display: grid; place-items: center;
+    }
+    #viewerClose:hover { color: var(--red); border-color: rgba(239,106,106,.5); }
+    .viewer-sub {
+      display: flex; gap: 8px; align-items: center;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    #viewerKw {
+      flex: 1; min-width: 140px;
+      background: var(--panel3); border: 1px solid var(--border); border-radius: 8px;
+      color: var(--text); padding: 5px 9px; font-size: 12px; outline: none;
+    }
+    #viewerKw:focus { border-color: var(--border-hi); }
+    #viewerCatChips { display: flex; gap: 5px; flex-wrap: wrap; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+    .vchip {
+      display: inline-flex; align-items: center; gap: 5px;
+      background: var(--panel2); border: 1px solid var(--border);
+      color: var(--muted);
+      border-radius: 999px; padding: 2.5px 10px; font-size: 11px; cursor: pointer;
+      transition: all .12s;
+      user-select: none;
+    }
+    .vchip i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .vchip.on { color: #fff; border-color: var(--border-hi); background: rgba(79,142,247,.16); }
+    #viewerBody { flex: 1; overflow-y: auto; padding: 10px 12px 16px; }
+    .v-loading { color: var(--muted); text-align: center; padding: 30px; font-size: 12px; }
+    .v-loading.err { color: var(--red); }
+    .vblock {
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--muted);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 8px 10px;
+      margin-bottom: 8px;
+    }
+    .vblock.cat-assistant { border-left-color: #4f8ef7; }
+    .vblock.cat-thinking { border-left-color: #9b7bf7; }
+    .vblock.cat-tool_call { border-left-color: #ffb454; }
+    .vblock.cat-tool_result { border-left-color: #37d6c0; }
+    .vblock.cat-user { border-left-color: #3ecf7a; }
+    .vblock.cat-system { border-left-color: #94a5ba; }
+    .vblock.is-err { border-color: rgba(239,106,106,.4); }
+    .vhead { display: flex; align-items: center; gap: 7px; font-size: 11.5px; }
+    .vhead i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+    .vhead b { color: var(--text); font-weight: 600; }
+    .vhead .vmeta { margin-left: auto; color: var(--muted); font-size: 10px; font-family: var(--mono); white-space: nowrap; }
+    .errtag {
+      color: var(--red); border: 1px solid rgba(239,106,106,.5);
+      border-radius: 4px; padding: 0 4px; font-size: 9.5px; font-weight: 700;
+    }
+    .vargs {
+      margin-top: 6px;
+      font-family: var(--mono); font-size: 11px;
+      color: var(--amber);
+      background: rgba(255,180,84,.07);
+      border: 1px solid rgba(255,180,84,.2);
+      border-radius: 6px;
+      padding: 5px 8px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .vtext {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--text-dim);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .viewer-foot {
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      color: var(--muted); font-size: 10.5px;
+      display: flex; justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+      </div>
+      <div>
+        <h1>会话追踪助手</h1>
+        <div class="sub">全量抓取 · 分类检索 · 一键申报</div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat acc"><b id="statTotal">–</b><span>会话总数</span></div>
+      <div class="stat cyan"><b id="statIndexed">–</b><span>已建索引</span></div>
+      <div class="stat green"><b id="statHits">–</b><span>当前命中</span></div>
+    </div>
+    <div class="toolbar">
+      <button id="loadBtn" class="primary">抓取全部</button>
+      <button id="indexBtn" disabled>重建索引</button>
+      <button id="clearBtn">清空勾选</button>
+    </div>
+  </header>
+
+  <div id="crawlBar">
+    <span id="crawlText">准备中…</span>
+    <div class="bar"><i id="crawlProgress"></i></div>
+  </div>
+
+  <div id="targetBanner">检测提交页中…</div>
+
+  <div class="searchwrap">
+    <div class="searchbar">
+      <span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg></span>
+      <input id="searchInput" placeholder="搜索：空格=且  | =或（标题/全文/工具）" />
+      <button class="clearkw" id="clearKw" title="清空"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+  </div>
+  <div class="filterbar">
+    <div class="fgroup">
+      <span class="chip on" data-f="all">全部</span>
+      <span class="chip" data-f="checked">已选</span>
+    </div>
+    <select class="sortsel" id="sortSel">
+      <option value="time">按时间↓</option>
+      <option value="calls">按调用次数↓</option>
+      <option value="tokens">按 tokens↓</option>
+      <option value="sid">按 ID↓</option>
+    </select>
+    <span class="count" id="countInfo"></span>
+  </div>
+  <div class="filterbar catbar">
+    <span class="catlabel">类目</span>
+    <div class="catgroup" id="catGroup">
+      <span class="catchip" data-cat="assistant"><i style="background:#4f8ef7"></i>模型响应</span>
+      <span class="catchip" data-cat="thinking"><i style="background:#9b7bf7"></i>思考过程</span>
+      <span class="catchip" data-cat="tool_call"><i style="background:#ffb454"></i>工具调用</span>
+      <span class="catchip" data-cat="tool_result"><i style="background:#37d6c0"></i>工具结果</span>
+      <span class="catchip" data-cat="user"><i style="background:#3ecf7a"></i>用户输入</span>
+      <span class="catchip" data-cat="system"><i style="background:#94a5ba"></i>系统注解</span>
+    </div>
+  </div>
+  <div class="hint">不点类目 = 搜全部（含标题）；点亮类目 = 只在这些类目里命中；空格=且，<code>|</code>=或</div>
+
+  <div id="list"><div class="empty"><svg class="big-icon" viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.5"/><path d="M4.9 8.5a9 9 0 0114.2 0M2 5.5a13 13 0 0120 0M7.8 11.6a5 5 0 018.4 0M12 18.5v.01"/></svg>点击「抓取全部」一次性拉取所有网关会话日志</div></div>
+
+  <div id="footbar">
+    <div class="stageSel">
+      <button data-stage="0" class="on">① 目标侦察</button>
+      <button data-stage="1">② 漏洞发现</button>
+      <button data-stage="2">③ 利用验证</button>
+    </div>
+    <button id="fillBtn" disabled>一键填入子步骤</button>
+    <div id="status"></div>
+  </div>
+
+  <!-- 会话详情查看器 -->
+  <div id="viewer">
+    <div class="viewer-panel">
+      <div class="viewer-head">
+        <b id="viewerTitle">会话详情</b>
+        <button id="viewerClose" title="关闭">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="viewer-sub">
+        <input id="viewerKw" placeholder="条目内过滤：空格=且  | =或" />
+      </div>
+      <div id="viewerCatChips"></div>
+      <div id="viewerBody"><div class="v-loading">加载中…</div></div>
+      <div class="viewer-foot">
+        <span>点击顶部类目 chip 过滤 · 关键词高亮定位</span>
+        <span>Esc 关闭</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
