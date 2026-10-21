@@ -60,7 +60,7 @@
           }
           case 'FETCH_DETAIL': {
             // 首页 + 预取页并行；剩余页再分批并行（page_size=100 为上限）
-            const PAGE_CONC = 10; // 单会话同时在途的翻页请求上限
+            const PAGE_CONC = 24; // 单会话同时在途的翻页请求上限（大分页会话不被拆成太多串行批次）
             const fetchPage = (p) =>
               apiPost('session_detail', {
                 project_code: PROJECT_CODE,

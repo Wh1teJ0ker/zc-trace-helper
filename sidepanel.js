@@ -3,7 +3,7 @@
  *   zcth:sessions  = { sid: 平台会话对象(不含 detail) }   列表元数据，一次写
  *   zcth:detail:<sid> = { entries: [...], n: 条数 }        每会话一条详情索引，独立写
  * - 首次抓取全量；之后增量（列表从第 1 页翻到已知 sid 即停）
- * - 索引并发 32；按事件数预取详情分页（省一次串行往返）；详情写入攒批落盘
+ * - 索引自适应并发 8–32（AIMD 自动贴住服务端上限）；按事件数预取详情分页；详情写入攒批落盘
  * - 打开面板只读缓存渲染，不自动重拉详情
  */
 
@@ -25,7 +25,9 @@ const statHits = $('#statHits');
 const catGroup = $('#catGroup');
 
 const PAGE_SIZE = 100;
-const IDX_CONCURRENCY = 32;      // 索引并发：32 条会话同时拉详情
+const IDX_MAX_WORKERS = 48;      // 索引工作协程上限（实际并发由控制器动态限制）
+const IDX_START_LIMIT = 8;       // 自适应并发起点
+const IDX_MAX_LIMIT = 32;        // 自适应并发上限
 const DETAIL_WRITE_BATCH = 16;   // 详情落盘批大小
 const DETAIL_WRITE_DELAY = 400;  // 或最长 400ms 落一次盘
 let stepsPerEvent = 0.5;         // 学习值：每 1 个 event 约等于多少 step，用于预取页数估算
@@ -229,7 +231,7 @@ async function crawlSessionsIncremental() {
   return { total, newCount };
 }
 
-// 为缺详情索引的会话建立索引（并发 16，批量落盘，失败重试一次）
+// 为缺详情索引的会话建立索引：自适应并发（AIMD）+ 批量落盘 + 失败重试一次
 async function buildIndex() {
   const need = [];
   for (const sid of sessions.keys()) {
@@ -242,12 +244,42 @@ async function buildIndex() {
   const detailKeys = [...details.keys()];
   const startedAt = Date.now();
 
+  // 自适应并发：每 3 秒按实测速率/错误率加减，自动停在服务端能承受的上限附近
+  let idxLimit = IDX_START_LIMIT;
+  let active = 0;
+  let bestRate = 0;
+  let rateEma = 0;
+  let lastDone = 0;
+  let lastErrs = 0;
+  let lastTick = Date.now();
+  const controller = setInterval(() => {
+    if (done >= total) return;
+    const now = Date.now();
+    const dt = Math.max((now - lastTick) / 1000, 0.001);
+    const rate = (done - lastDone) / dt;
+    const newErrs = errs.length - lastErrs;
+    lastDone = done;
+    lastErrs = errs.length;
+    lastTick = now;
+    rateEma = rateEma ? rateEma * 0.5 + rate * 0.5 : rate; // 平滑，避免小样本抖动
+    if (newErrs > 0) {
+      idxLimit = Math.max(4, Math.floor(idxLimit * 0.75)); // 出错：退避
+    } else if (rateEma > 0) {
+      if (rateEma < bestRate * 0.85) {
+        idxLimit = Math.max(4, Math.floor(idxLimit * 0.75)); // 速率明显下降：退避
+      } else {
+        bestRate = Math.max(bestRate, rateEma);
+        idxLimit = Math.min(IDX_MAX_LIMIT, idxLimit + 4); // 还有余量：继续加
+      }
+    }
+  }, 3000);
+
   const fetchOne = async (sid) => {
     const meta = sessions.get(sid) || {};
     const ev = Number(meta.event_count ?? meta.range_call_count ?? 0) || 0;
-    // 按学习到的 step/event 比例估算总页数，首页与后续页并行预取，省掉一次串行往返
+    // 按学习到的 step/event 比例估算总页数，首页与估算页并行预取（上限 4 页，避免过度请求）
     const estPages = ev > 0
-      ? Math.max(1, Math.min(Math.ceil((ev * stepsPerEvent) / PAGE_SIZE), 8))
+      ? Math.max(1, Math.min(Math.ceil((ev * stepsPerEvent) / PAGE_SIZE), 4))
       : 1;
 
     let lastErr = null;
@@ -270,8 +302,11 @@ async function buildIndex() {
 
   const worker = async () => {
     while (need.length) {
+      while (active >= idxLimit) await new Promise(r => setTimeout(r, 60)); // 等动态并发槽位
+      if (!need.length) break;
       const sid = need.shift();
       if (sid === undefined) break;
+      active++;
       try {
         const resp = await fetchOne(sid);
         const detail = { entries: resp.entries || [] };
@@ -281,6 +316,8 @@ async function buildIndex() {
       } catch (e) {
         // 失败不落盘空索引，留待下次抓取/重建时重试
         errs.push({ sid, msg: e?.message || String(e) });
+      } finally {
+        active--;
       }
       done++;
       if (done % 5 === 0 || done === total) {
@@ -290,13 +327,17 @@ async function buildIndex() {
         const eta = remain > 0 ? Math.ceil(remain / perSec) : 0;
         setProgress(
           (done / total) * 100,
-          `会话索引：${done}/${total} · ${perSec.toFixed(1)} 条/秒${remain > 0 ? ` · 剩余约 ${eta}s` : ''}${errs.length ? `（失败 ${errs.length}）` : ''}`,
+          `会话索引：${done}/${total} · ${perSec.toFixed(1)} 条/秒 · 并发 ${idxLimit}${remain > 0 ? ` · 剩余约 ${eta}s` : ''}${errs.length ? `（失败 ${errs.length}）` : ''}`,
         );
       }
     }
   };
 
-  await Promise.all(Array.from({ length: Math.min(IDX_CONCURRENCY, total) }, worker));
+  try {
+    await Promise.all(Array.from({ length: Math.min(IDX_MAX_WORKERS, total) }, worker));
+  } finally {
+    clearInterval(controller);
+  }
   await flushDetailWrites();
   await saveDetailKeys(detailKeys);
   return { total, errs };
