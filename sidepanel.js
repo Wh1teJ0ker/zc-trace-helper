@@ -57,18 +57,33 @@ function setStatus(msg, kind = '', sticky = false) {
   if (msg && !sticky) statusTimer = setTimeout(() => { statusEl.textContent = ''; statusEl.className = ''; }, 6000);
 }
 
+/* ---------- 全局错误捕获：把异常显示到状态栏，避免"静默崩溃" ---------- */
+window.addEventListener('error', (e) => {
+  try { setStatus(`面板错误：${e.message || e}`, 'err', true); } catch {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { setStatus(`面板异常：${e.reason?.message || e.reason}`, 'err', true); } catch {}
+});
+
 /* ---------- 持久化（分键存储） ---------- */
+async function safeSet(obj) {
+  try {
+    await chrome.storage.local.set(obj);
+  } catch (e) {
+    setStatus(`存储写入失败：${e.message}`, 'err');
+  }
+}
 async function saveSessions() {
   const obj = {};
   for (const [sid, item] of sessions) obj[sid] = item;
-  await chrome.storage.local.set({ [KEY_SESSIONS]: obj, lastCrawlAt });
+  await safeSet({ [KEY_SESSIONS]: obj, lastCrawlAt });
 }
 async function saveDetail(sid, detail) {
-  await chrome.storage.local.set({ [KEY_DETAIL(sid)]: detail });
+  await safeSet({ [KEY_DETAIL(sid)]: detail });
 }
 // 记录有哪些 detail 键，便于加载与清理
 async function saveDetailKeys(keys) {
-  await chrome.storage.local.set({ 'zcth:detailKeys': keys });
+  await safeSet({ 'zcth:detailKeys': keys });
 }
 
 async function loadStore() {
@@ -263,7 +278,7 @@ async function rebuildIndex() {
   }
 }
 
-/* ---------- 查询 ---------- */
+/* ---------- 查询（不缓存全文，直接扫描，内存恒定） ---------- */
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -274,48 +289,78 @@ function parseQuery(q) {
   return q.trim().split('|').map(g => g.trim().split(/\s+/).filter(Boolean).map(w => w.toLowerCase())).filter(g => g.length);
 }
 
-// 类目 → 文本缓存（会话 × 类目），搜索时惰性构建
-const hayCache = new Map(); // sid -> { title, cat: {catKey: text} }
-function getHay(sid, item) {
-  let h = hayCache.get(sid);
-  if (h) return h;
-  h = { title: ((item.title || '') + ' ' + sid + ' ' + (item.model || '')).toLowerCase(), cat: {} };
-  const d = details.get(sid);
-  if (d) {
-    for (const e of d.entries) {
-      const t = ((e.args || '') + '\n' + (e.text || '') + '\n' + (e.tool || '')).toLowerCase();
-      h.cat[e.cat] = (h.cat[e.cat] || '') + '\n' + t;
+// 编译匹配器：每组（OR）内的词（AND）各编译一个大小写不敏感正则，避免为大文本生成小写副本
+function buildMatchers(groups) {
+  return groups.map(g => g.map(w => ({ w, re: new RegExp(escapeReg(w), 'i') })));
+}
+
+function entryHay(e) {
+  return (e.args ? e.args + '\n' : '') + (e.text || '') + (e.tool ? '\n' + e.tool : '');
+}
+function anyTermIn(hay, matchers) {
+  for (const g of matchers) {
+    let all = true;
+    for (const t of g) {
+      if (!t.re.test(hay)) { all = false; break; }
     }
+    if (all) return true;
   }
-  hayCache.set(sid, h);
-  return h;
-}
-// 失效缓存（删除会话时）
-function dropHay(sid) { hayCache.delete(sid); }
-
-function matchItem(sid, item, groups, catKeys) {
-  if (!groups.length) return true;
-  const h = getHay(sid, item);
-  const hays = [h.title];
-  for (const ck of catKeys) {
-    if (ck !== 'title') hays.push(h.cat[ck] || '');
-  }
-  return groups.some(g => g.every(w => hays.some(x => x && x.includes(w))));
+  return false;
 }
 
-function hitCats(sid, item, groups, catKeys) {
-  if (!groups.length) return [];
-  const h = getHay(sid, item);
+// 命中判定：标题/ID/模型 或（所选类目的条目）
+function matchItem(sid, item, matchers, catKeys) {
+  if (!matchers.length) return true;
+  const titleHay = (item.title || '') + ' ' + sid + ' ' + (item.model || '');
+  if (anyTermIn(titleHay, matchers)) return true;
+  const d = details.get(sid);
+  if (!d) return false;
+  const only = catKeys.length ? new Set(catKeys) : null;
+  for (const e of d.entries) {
+    if (only && !only.has(e.cat)) continue;
+    if (anyTermIn(entryHay(e), matchers)) return true;
+  }
+  return false;
+}
+
+// 命中类目集合（一次扫描）
+function hitCats(sid, item, matchers, catKeys) {
+  if (!matchers.length) return [];
   const out = new Set();
-  for (const g of groups) {
-    for (const w of g) {
-      if (h.title.includes(w)) out.add('title');
-      for (const ck of catKeys) {
-        if ((h.cat[ck] || '').includes(w)) out.add(ck);
+  const titleHay = (item.title || '') + ' ' + sid + ' ' + (item.model || '');
+  for (const g of matchers) for (const t of g) {
+    if (t.re.test(titleHay)) out.add('title');
+  }
+  const d = details.get(sid);
+  if (!d) return [...out];
+  const only = catKeys.length ? new Set(catKeys) : null;
+  for (const e of d.entries) {
+    if (only && !only.has(e.cat)) continue;
+    if (out.has(e.cat)) continue;
+    if (anyTermIn(entryHay(e), matchers)) out.add(e.cat);
+  }
+  return [...out];
+}
+
+function bestExcerpt(sid, item, matchers) {
+  const d = details.get(sid);
+  if (!d || !matchers.length) return null;
+  for (const e of d.entries) {
+    const src = (e.args ? e.args + '\n' : '') + (e.text || '');
+    if (!src) continue;
+    for (const g of matchers) {
+      for (const t of g) {
+        const m = t.re.exec(src);
+        if (!m) continue;
+        const idx = m.index;
+        const start = Math.max(0, idx - 50);
+        const end = Math.min(src.length, idx + t.w.length + 90);
+        let frag = (start > 0 ? '…' : '') + src.slice(start, end).replace(/\s+/g, ' ') + (end < src.length ? '…' : '');
+        return { cat: e.cat, html: highlight(escapeHtml(frag), matchers) };
       }
     }
   }
-  return [...out];
+  return null;
 }
 
 function currentCatKeys() {
@@ -352,31 +397,15 @@ function fmtTokens(u) {
   if (total >= 1000) return `${(total / 1000).toFixed(1)}K tok`;
   return `${total} tok`;
 }
-function highlight(textHtml, words) {
-  if (!words.length) return textHtml;
+// 高亮：接受 matchers（{w,re}）或纯词数组
+function highlight(textHtml, matchersOrWords) {
+  if (!matchersOrWords.length) return textHtml;
   let out = textHtml;
+  const words = matchersOrWords.map(x => (typeof x === 'string' ? x : x.w));
   for (const w of words) {
     out = out.replace(new RegExp(escapeReg(escapeHtml(w)), 'gi'), (m) => `<mark>${m}</mark>`);
   }
   return out;
-}
-function bestExcerpt(sid, item, words) {
-  const d = details.get(sid);
-  if (!d || !words.length) return null;
-  for (const e of d.entries) {
-    const src = (e.args ? e.args + '\n' : '') + (e.text || '');
-    const hay = src.toLowerCase();
-    for (const w of words) {
-      const idx = hay.indexOf(w.toLowerCase());
-      if (idx !== -1) {
-        const start = Math.max(0, idx - 50);
-        const end = Math.min(src.length, idx + w.length + 90);
-        let frag = (start > 0 ? '…' : '') + src.slice(start, end).replace(/\s+/g, ' ') + (end < src.length ? '…' : '');
-        return { cat: e.cat, html: highlight(escapeHtml(frag), words) };
-      }
-    }
-  }
-  return null;
 }
 
 function currentFilter() {
@@ -389,26 +418,30 @@ function updateStats() {
   statIndexed.textContent = sessions.size ? details.size : '–';
   const kw = searchInput.value.trim();
   if (kw && sessions.size) {
-    const groups = parseQuery(kw);
+    const matchers = buildMatchers(parseQuery(kw));
     const cats = currentCatKeys();
     let hits = 0;
-    for (const [sid, it] of sessions) if (matchItem(sid, it, groups, cats)) hits++;
+    for (const [sid, it] of sessions) if (matchItem(sid, it, matchers, cats)) hits++;
     statHits.textContent = hits;
   } else {
     statHits.textContent = '–';
   }
 }
 
+/* 分块渲染：一次最多画 RENDER_CHUNK 张卡片，避免数百卡片一次性建 DOM */
+const RENDER_CHUNK = 60;
+let renderState = { list: [], rendered: 0, matchers: [], hasKw: false };
+
 function renderList() {
   const kw = searchInput.value.trim();
   const groups = parseQuery(kw);
   const hasKw = groups.length > 0;
-  const words = [...new Set(groups.flat())];
+  const matchers = buildMatchers(groups);
   const cats = currentCatKeys();
   const filter = currentFilter();
 
   let list = [...sessions.entries()].map(([sid, it]) => ({ sid, ...it }));
-  if (hasKw) list = list.filter(it => matchItem(it.sid, it, groups, cats));
+  if (hasKw) list = list.filter(it => matchItem(it.sid, it, matchers, cats));
   if (filter === 'checked') list = list.filter(it => checkedOrder.includes(it.sid));
   sortItems(list);
 
@@ -421,116 +454,138 @@ function renderList() {
   }
 
   listEl.innerHTML = '';
-  for (const s of list) {
-    const sid = String(s.sid);
-    const div = document.createElement('div');
-    div.className = 'item' + (checkedOrder.includes(sid) ? ' checked' : '');
-    div.dataset.sid = sid;
-
-    const row1 = document.createElement('div');
-    row1.className = 'row1';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.className = 'checkbox';
-    cb.checked = checkedOrder.includes(sid);
-    cb.addEventListener('click', (e) => e.stopPropagation());
-    cb.addEventListener('change', () => toggleCheck(sid, cb.checked));
-    const sidEl = document.createElement('span');
-    sidEl.className = 'sid';
-    sidEl.textContent = `#${sid}`;
-    const time = document.createElement('span');
-    time.className = 'time';
-    time.textContent = fmtTime(s.last_active_at || s.first_captured_at);
-    row1.append(cb, sidEl, time);
-
-    const title = document.createElement('div');
-    title.className = 'title';
-    const rawTitle = escapeHtml((s.title || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || '(无标题)');
-    title.innerHTML = highlight(rawTitle, words);
-    title.title = (s.title || '').replace(/<[^>]+>/g, ' ').trim();
-
-    div.appendChild(row1);
-    div.appendChild(title);
-
-    if (hasKw) {
-      const hitList = hitCats(sid, s, groups, cats);
-      if (hitList.length) {
-        const hitRow = document.createElement('div');
-        hitRow.className = 'row3';
-        for (const ck of hitList) {
-          const t = document.createElement('span');
-          t.className = 'tag hit';
-          t.textContent = ck === 'title' ? '标题' : CATS[ck]?.label || ck;
-          hitRow.appendChild(t);
-        }
-        div.appendChild(hitRow);
-      }
-      const ex = bestExcerpt(sid, s, words);
-      if (ex) {
-        const exDiv = document.createElement('div');
-        exDiv.className = 'excerpt';
-        exDiv.innerHTML = ex.html;
-        div.appendChild(exDiv);
-      }
-    }
-
-    const row3 = document.createElement('div');
-    row3.className = 'row3';
-    const mkTag = (txt, cls = '') => {
-      const t = document.createElement('span');
-      t.className = 'tag ' + cls;
-      t.textContent = txt;
-      return t;
-    };
-    row3.append(
-      mkTag(s.model || 'unknown', 'model'),
-      mkTag(`${s.range_call_count ?? s.event_count ?? 0} 次`),
-      mkTag(fmtTokens(s.total_usage)),
-    );
-
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-    const viewBtn = document.createElement('button');
-    viewBtn.textContent = '查看详情';
-    viewBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openViewer(sid);
-    });
-    const fillOne = document.createElement('button');
-    fillOne.textContent = '填入此条';
-    fillOne.addEventListener('click', (e) => {
-      e.stopPropagation();
-      fillSessions([sid]);
-    });
-    const delOne = document.createElement('button');
-    delOne.textContent = '删除';
-    delOne.className = 'danger';
-    delOne.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      sessions.delete(sid);
-      details.delete(sid);
-      dropHay(sid);
-      await chrome.storage.local.remove(KEY_DETAIL(sid));
-      await saveSessions();
-      const dkeys = [...details.keys()];
-      await saveDetailKeys(dkeys);
-      const ci = checkedOrder.indexOf(sid);
-      if (ci !== -1) checkedOrder.splice(ci, 1);
-      renderList();
-    });
-    actions.append(viewBtn, fillOne, delOne);
-
-    div.addEventListener('click', () => {
-      const cb2 = div.querySelector('.checkbox');
-      cb2.checked = !cb2.checked;
-      toggleCheck(sid, cb2.checked);
-    });
-
-    div.appendChild(row3);
-    div.appendChild(actions);
-    listEl.appendChild(div);
-  }
+  renderState = { list, rendered: 0, matchers, hasKw };
+  appendChunk();
   updateStats();
+}
+
+function appendChunk() {
+  const { list, matchers, hasKw } = renderState;
+  const end = Math.min(renderState.rendered + RENDER_CHUNK, list.length);
+  for (let i = renderState.rendered; i < end; i++) {
+    listEl.appendChild(buildCard(list[i], matchers, hasKw));
+  }
+  renderState.rendered = end;
+
+  // 移除旧的"加载更多"
+  const oldMore = listEl.querySelector('.more-btn');
+  if (oldMore) oldMore.remove();
+  if (end < list.length) {
+    const more = document.createElement('button');
+    more.className = 'more-btn';
+    more.textContent = `显示更多（已显示 ${end}/${list.length}）`;
+    more.addEventListener('click', appendChunk);
+    listEl.appendChild(more);
+  }
+}
+
+function buildCard(s, matchers, hasKw) {
+  const sid = String(s.sid);
+  const div = document.createElement('div');
+  div.className = 'item' + (checkedOrder.includes(sid) ? ' checked' : '');
+  div.dataset.sid = sid;
+
+  const row1 = document.createElement('div');
+  row1.className = 'row1';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'checkbox';
+  cb.checked = checkedOrder.includes(sid);
+  cb.addEventListener('click', (e) => e.stopPropagation());
+  cb.addEventListener('change', () => toggleCheck(sid, cb.checked));
+  const sidEl = document.createElement('span');
+  sidEl.className = 'sid';
+  sidEl.textContent = `#${sid}`;
+  const time = document.createElement('span');
+  time.className = 'time';
+  time.textContent = fmtTime(s.last_active_at || s.first_captured_at);
+  row1.append(cb, sidEl, time);
+
+  const title = document.createElement('div');
+  title.className = 'title';
+  const rawTitle = escapeHtml((s.title || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || '(无标题)');
+  title.innerHTML = highlight(rawTitle, matchers);
+  title.title = (s.title || '').replace(/<[^>]+>/g, ' ').trim();
+
+  div.appendChild(row1);
+  div.appendChild(title);
+
+  if (hasKw) {
+    const hitList = hitCats(sid, s, matchers, currentCatKeys());
+    if (hitList.length) {
+      const hitRow = document.createElement('div');
+      hitRow.className = 'row3';
+      for (const ck of hitList) {
+        const t = document.createElement('span');
+        t.className = 'tag hit';
+        t.textContent = ck === 'title' ? '标题' : CATS[ck]?.label || ck;
+        hitRow.appendChild(t);
+      }
+      div.appendChild(hitRow);
+    }
+    const ex = bestExcerpt(sid, s, matchers);
+    if (ex) {
+      const exDiv = document.createElement('div');
+      exDiv.className = 'excerpt';
+      exDiv.innerHTML = ex.html;
+      div.appendChild(exDiv);
+    }
+  }
+
+  const row3 = document.createElement('div');
+  row3.className = 'row3';
+  const mkTag = (txt, cls = '') => {
+    const t = document.createElement('span');
+    t.className = 'tag ' + cls;
+    t.textContent = txt;
+    return t;
+  };
+  row3.append(
+    mkTag(s.model || 'unknown', 'model'),
+    mkTag(`${s.range_call_count ?? s.event_count ?? 0} 次`),
+    mkTag(fmtTokens(s.total_usage)),
+  );
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const viewBtn = document.createElement('button');
+  viewBtn.textContent = '查看详情';
+  viewBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openViewer(sid);
+  });
+  const fillOne = document.createElement('button');
+  fillOne.textContent = '填入此条';
+  fillOne.addEventListener('click', (e) => {
+    e.stopPropagation();
+    fillSessions([sid]);
+  });
+  const delOne = document.createElement('button');
+  delOne.textContent = '删除';
+  delOne.className = 'danger';
+  delOne.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    sessions.delete(sid);
+    details.delete(sid);
+    await chrome.storage.local.remove(KEY_DETAIL(sid));
+    await saveSessions();
+    const dkeys = [...details.keys()];
+    await saveDetailKeys(dkeys);
+    const ci = checkedOrder.indexOf(sid);
+    if (ci !== -1) checkedOrder.splice(ci, 1);
+    renderList();
+  });
+  actions.append(viewBtn, fillOne, delOne);
+
+  div.addEventListener('click', () => {
+    const cb2 = div.querySelector('.checkbox');
+    cb2.checked = !cb2.checked;
+    toggleCheck(sid, cb2.checked);
+  });
+
+  div.appendChild(row3);
+  div.appendChild(actions);
+  return div;
 }
 
 function toggleCheck(sid, on) {
@@ -578,7 +633,6 @@ async function openViewer(sid) {
       await saveDetail(sid, detail);
       const dkeys = [...details.keys()];
       await saveDetailKeys(dkeys);
-      hayCache.delete(sid);
     } catch (e) {
       viewerBody.innerHTML = `<div class="v-loading err">拉取失败：${escapeHtml(e.message)}</div>`;
       return;
@@ -630,17 +684,19 @@ function renderViewerCatChips() {
   }
 }
 
+/* 查看器也分块渲染，避免大会话一次性建上千 DOM 节点 */
+const VIEW_CHUNK = 40;
+let viewerState = { list: [], rendered: 0, words: [] };
+
 function renderViewer() {
   const kw = viewerKw.value.trim();
   const groups = parseQuery(kw);
+  const matchers = buildMatchers(groups);
   const words = [...new Set(groups.flat())];
   let list = viewerEntries;
   if (viewerCats.size) list = list.filter(e => viewerCats.has(e.cat));
-  if (kw) {
-    list = list.filter(e => {
-      const hay = ((e.args || '') + '\n' + (e.text || '') + ' ' + (e.tool || '')).toLowerCase();
-      return groups.some(g => g.every(w => hay.includes(w)));
-    });
+  if (matchers.length) {
+    list = list.filter(e => anyTermIn(entryHay(e), matchers));
   }
 
   if (!list.length) {
@@ -649,33 +705,54 @@ function renderViewer() {
   }
 
   viewerBody.innerHTML = '';
-  for (const e of list) {
-    const block = document.createElement('div');
-    block.className = `vblock cat-${e.cat}` + (e.isError ? ' is-err' : '');
+  viewerState = { list, rendered: 0, words };
+  appendViewerChunk();
+}
 
-    const head = document.createElement('div');
-    head.className = 'vhead';
-    const def = CATS[e.cat] || CATS.other;
-    head.innerHTML = `<i style="background:${def.color}"></i>
-      <b>${def.label}${e.tool ? ` · ${escapeHtml(e.tool)}` : ''}${e.isError ? ' <span class="errtag">错误</span>' : ''}</b>
-      <span class="vmeta">#${e.seq} · ${fmtTime(e.time)} · ${e.charLen} 字</span>`;
-    block.appendChild(head);
-
-    if (e.args) {
-      const argsDiv = document.createElement('div');
-      argsDiv.className = 'vargs';
-      argsDiv.innerHTML = highlight(escapeHtml(e.args), words);
-      block.appendChild(argsDiv);
-    }
-
-    const textDiv = document.createElement('div');
-    textDiv.className = 'vtext';
-    const raw = e.text || '(空)';
-    textDiv.innerHTML = highlight(escapeHtml(raw.length > 20000 ? raw.slice(0, 20000) + '\n…(过长截断)' : raw), words);
-    block.appendChild(textDiv);
-
-    viewerBody.appendChild(block);
+function appendViewerChunk() {
+  const { list, words } = viewerState;
+  const end = Math.min(viewerState.rendered + VIEW_CHUNK, list.length);
+  for (let i = viewerState.rendered; i < end; i++) {
+    viewerBody.appendChild(buildViewerBlock(list[i], words));
   }
+  viewerState.rendered = end;
+
+  const oldMore = viewerBody.querySelector('.more-btn');
+  if (oldMore) oldMore.remove();
+  if (end < list.length) {
+    const more = document.createElement('button');
+    more.className = 'more-btn';
+    more.textContent = `显示更多（已显示 ${end}/${list.length}）`;
+    more.addEventListener('click', appendViewerChunk);
+    viewerBody.appendChild(more);
+  }
+}
+
+function buildViewerBlock(e, words) {
+  const block = document.createElement('div');
+  block.className = `vblock cat-${e.cat}` + (e.isError ? ' is-err' : '');
+
+  const head = document.createElement('div');
+  head.className = 'vhead';
+  const def = CATS[e.cat] || CATS.other;
+  head.innerHTML = `<i style="background:${def.color}"></i>
+    <b>${def.label}${e.tool ? ` · ${escapeHtml(e.tool)}` : ''}${e.isError ? ' <span class="errtag">错误</span>' : ''}</b>
+    <span class="vmeta">#${e.seq} · ${fmtTime(e.time)} · ${e.charLen} 字</span>`;
+  block.appendChild(head);
+
+  if (e.args) {
+    const argsDiv = document.createElement('div');
+    argsDiv.className = 'vargs';
+    argsDiv.innerHTML = highlight(escapeHtml(e.args), words);
+    block.appendChild(argsDiv);
+  }
+
+  const textDiv = document.createElement('div');
+  textDiv.className = 'vtext';
+  const raw = e.text || '(空)';
+  textDiv.innerHTML = highlight(escapeHtml(raw.length > 8000 ? raw.slice(0, 8000) + '\n…(过长截断)' : raw), words);
+  block.appendChild(textDiv);
+  return block;
 }
 
 viewerKw.addEventListener('input', () => renderViewer());
