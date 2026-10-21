@@ -3,7 +3,7 @@
  *   zcth:sessions  = { sid: 平台会话对象(不含 detail) }   列表元数据，一次写
  *   zcth:detail:<sid> = { entries: [...], n: 条数 }        每会话一条详情索引，独立写
  * - 首次抓取全量；之后增量（列表从第 1 页翻到已知 sid 即停）
- * - 索引并发 8；详情多页在 content script 内并行
+ * - 索引并发 16；详情多页在 content script 内并行；详情写入攒批落盘
  * - 打开面板只读缓存渲染，不自动重拉详情
  */
 
@@ -25,7 +25,9 @@ const statHits = $('#statHits');
 const catGroup = $('#catGroup');
 
 const PAGE_SIZE = 100;
-const IDX_CONCURRENCY = 8;
+const IDX_CONCURRENCY = 16;      // 索引并发：16 条会话同时拉详情
+const DETAIL_WRITE_BATCH = 16;   // 详情落盘批大小
+const DETAIL_WRITE_DELAY = 400;  // 或最长 400ms 落一次盘
 const KEY_SESSIONS = 'zcth:sessions';
 const KEY_DETAIL = (sid) => `zcth:detail:${sid}`;
 
@@ -86,6 +88,27 @@ async function saveDetailKeys(keys) {
   await safeSet({ 'zcth:detailKeys': keys });
 }
 
+// 索引期间的详情写入先入队，攒批落盘，避免每会话一次 storage IPC
+const pendingDetails = new Map();
+let detailFlushTimer = null;
+function queueDetailSave(sid, detail) {
+  pendingDetails.set(KEY_DETAIL(sid), detail);
+  if (pendingDetails.size >= DETAIL_WRITE_BATCH) { flushDetailWrites(); return; }
+  if (!detailFlushTimer) detailFlushTimer = setTimeout(flushDetailWrites, DETAIL_WRITE_DELAY);
+}
+async function flushDetailWrites() {
+  clearTimeout(detailFlushTimer);
+  detailFlushTimer = null;
+  if (!pendingDetails.size) return;
+  const obj = Object.fromEntries(pendingDetails);
+  pendingDetails.clear();
+  await safeSet(obj);
+}
+window.addEventListener('pagehide', () => { flushDetailWrites(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushDetailWrites();
+});
+
 async function loadStore() {
   const { [KEY_SESSIONS]: stored, lastCrawlAt: lca, 'zcth:detailKeys': dkeys } = await chrome.storage.local.get([KEY_SESSIONS, 'lastCrawlAt', 'zcth:detailKeys']);
   sessions = new Map(Object.entries(stored || {}));
@@ -94,23 +117,54 @@ async function loadStore() {
   if (Array.isArray(dkeys) && dkeys.length) {
     const keys = dkeys.map(sid => KEY_DETAIL(sid));
     const chunk = 64;
-    for (let i = 0; i < keys.length; i += chunk) {
-      const part = await chrome.storage.local.get(keys.slice(i, i + chunk));
-      for (const [k, v] of Object.entries(part)) {
-        const sid = k.replace('zcth:detail:', '');
-        if (v && v.entries) details.set(sid, v);
+    const chunks = [];
+    for (let i = 0; i < keys.length; i += chunk) chunks.push(keys.slice(i, i + chunk));
+    // 分组并行读取，减少面板启动时的串行等待
+    for (let i = 0; i < chunks.length; i += 8) {
+      const parts = await Promise.all(chunks.slice(i, i + 8).map(c => chrome.storage.local.get(c)));
+      for (const part of parts) {
+        for (const [k, v] of Object.entries(part)) {
+          const sid = k.replace('zcth:detail:', '');
+          if (v && v.entries) details.set(sid, v);
+        }
       }
     }
   }
 }
 
 /* ---------- 与内容脚本通信 ---------- */
-async function sendToContent(message) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url || !tab.url.startsWith('https://zc.tencent.com')) {
-    throw new Error('请先打开 zc.tencent.com 的页面');
+// 缓存目标 tab，避免每条消息都全窗口 query 一次；失效（刷新/关页）时自动重查
+let cachedTabId = null;
+
+async function resolveTab() {
+  if (cachedTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(cachedTabId);
+      if (tab && tab.url && tab.url.startsWith('https://zc.tencent.com')) return tab;
+    } catch {}
+    cachedTabId = null;
   }
-  return chrome.tabs.sendMessage(tab.id, message);
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let tab = active && active.url && active.url.startsWith('https://zc.tencent.com') ? active : null;
+  if (!tab) {
+    // 激活的不是 ZC 页时，任意 ZC 标签页都能代理接口（优先漏洞提交页）
+    const zcTabs = await chrome.tabs.query({ url: 'https://zc.tencent.com/*' });
+    tab = zcTabs.find(t => (t.url || '').includes('vulnSubmit')) || zcTabs[0] || null;
+  }
+  if (!tab) throw new Error('请先打开 zc.tencent.com 的页面');
+  cachedTabId = tab.id;
+  return tab;
+}
+
+async function sendToContent(message) {
+  const tab = await resolveTab();
+  try {
+    return await chrome.tabs.sendMessage(tab.id, message);
+  } catch (e) {
+    cachedTabId = null; // 缓存失效，重查一次
+    const tab2 = await resolveTab();
+    return chrome.tabs.sendMessage(tab2.id, message);
+  }
 }
 
 async function pingContent() {
@@ -174,7 +228,7 @@ async function crawlSessionsIncremental() {
   return { total, newCount };
 }
 
-// 为缺详情索引的会话建立索引（并发 8，逐条落盘不阻塞）
+// 为缺详情索引的会话建立索引（并发 16，批量落盘，失败重试一次）
 async function buildIndex() {
   const need = [];
   for (const sid of sessions.keys()) {
@@ -185,33 +239,53 @@ async function buildIndex() {
   let done = 0;
   const errs = [];
   const detailKeys = [...details.keys()];
+  const startedAt = Date.now();
+
+  const fetchOne = async (sid) => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const resp = await sendToContent({ type: 'FETCH_DETAIL', sessionId: Number(sid) });
+        if (!resp.ok) throw new Error(resp.error || '详情失败');
+        return resp;
+      } catch (e) {
+        lastErr = e;
+        if (attempt === 0) await new Promise(r => setTimeout(r, 300));
+      }
+    }
+    throw lastErr;
+  };
 
   const worker = async () => {
     while (need.length) {
       const sid = need.shift();
       if (sid === undefined) break;
       try {
-        const resp = await sendToContent({ type: 'FETCH_DETAIL', sessionId: Number(sid) });
-        if (!resp.ok) throw new Error(resp.error || '详情失败');
+        const resp = await fetchOne(sid);
         const detail = { entries: resp.entries || [] };
         details.set(sid, detail);
         detailKeys.push(sid);
-        await saveDetail(sid, detail); // 单键小写入，不阻塞其他 worker
+        queueDetailSave(sid, detail); // 攒批落盘
       } catch (e) {
-        errs.push({ sid, msg: e.message });
-        const detail = { entries: [] };
-        details.set(sid, detail);
-        detailKeys.push(sid);
-        await saveDetail(sid, detail);
+        // 失败不落盘空索引，留待下次抓取/重建时重试
+        errs.push({ sid, msg: e?.message || String(e) });
       }
       done++;
       if (done % 5 === 0 || done === total) {
-        setProgress((done / total) * 100, `会话索引：${done}/${total}${errs.length ? `（失败 ${errs.length}）` : ''}`);
+        const sec = Math.max((Date.now() - startedAt) / 1000, 0.001);
+        const perSec = done / sec;
+        const remain = total - done;
+        const eta = remain > 0 ? Math.ceil(remain / perSec) : 0;
+        setProgress(
+          (done / total) * 100,
+          `会话索引：${done}/${total} · ${perSec.toFixed(1)} 条/秒${remain > 0 ? ` · 剩余约 ${eta}s` : ''}${errs.length ? `（失败 ${errs.length}）` : ''}`,
+        );
       }
     }
   };
 
   await Promise.all(Array.from({ length: Math.min(IDX_CONCURRENCY, total) }, worker));
+  await flushDetailWrites();
   await saveDetailKeys(detailKeys);
   return { total, errs };
 }
@@ -258,7 +332,10 @@ async function rebuildIndex() {
   $('#loadBtn').disabled = true;
   showCrawl(true);
   try {
-    // 清掉旧 detail 键
+    // 清掉旧 detail 键（同时丢弃未落盘的旧队列，避免把旧数据写回来）
+    clearTimeout(detailFlushTimer);
+    detailFlushTimer = null;
+    pendingDetails.clear();
     const removeKeys = [...details.keys()].map(sid => KEY_DETAIL(sid));
     details = new Map();
     if (removeKeys.length) {
@@ -280,10 +357,10 @@ async function rebuildIndex() {
 
 /* ---------- 查询（不缓存全文，直接扫描，内存恒定） ---------- */
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 function escapeReg(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 function parseQuery(q) {
   return q.trim().split('|').map(g => g.trim().split(/\s+/).filter(Boolean).map(w => w.toLowerCase())).filter(g => g.length);
@@ -563,11 +640,12 @@ function buildCard(s, matchers, hasKw) {
   const delOne = document.createElement('button');
   delOne.textContent = '删除';
   delOne.className = 'danger';
-  delOne.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    sessions.delete(sid);
-    details.delete(sid);
-    await chrome.storage.local.remove(KEY_DETAIL(sid));
+    delOne.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      sessions.delete(sid);
+      details.delete(sid);
+      pendingDetails.delete(KEY_DETAIL(sid));
+      await chrome.storage.local.remove(KEY_DETAIL(sid));
     await saveSessions();
     const dkeys = [...details.keys()];
     await saveDetailKeys(dkeys);
@@ -634,7 +712,7 @@ async function openViewer(sid) {
       const dkeys = [...details.keys()];
       await saveDetailKeys(dkeys);
     } catch (e) {
-      viewerBody.innerHTML = `<div class="v-loading err">拉取失败：${escapeHtml(e.message)}</div>`;
+      viewerBody.innerHTML = `<div class="v-loading err">拉取失败：${escapeHtml(e?.message || e)}</div>`;
       return;
     }
   } else {
@@ -787,7 +865,7 @@ async function fillSessions(sids) {
       if (resp.ok) { ok++; } else { fail++; setStatus(`#${sid} 填入失败：${resp.error}`, 'err'); }
     } catch (e) {
       fail++;
-      setStatus(`#${sid} 通信失败：${e.message}`, 'err');
+      setStatus(`#${sid} 通信失败：${e?.message || e}`, 'err');
     }
   }
   setStatus(`填入完成：成功 ${ok} 条${fail ? `，失败 ${fail} 条` : ''}（${stageNames[targetStage]}）`, fail ? 'err' : 'ok');

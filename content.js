@@ -8,6 +8,7 @@
 (() => {
   const PROJECT_CODE = new URLSearchParams(location.search).get('project_code') || 'PROJ2026_AISRC01';
   const API_BASE = '/api/v1/whitehat/ai_gateway';
+  const MAX_TEXT = 100000; // 单条文本上限，避免超长会话拖慢传输/存储
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -87,8 +88,10 @@
                 for (const item of step.items || []) {
                   if (!item.text && !(item.args && Object.keys(item.args).length)) continue;
                   const cat = categorize(item);
-                  const argsStr = item.args ? argsToText(item.args) : '';
-                  const text = item.text || '';
+                  let argsStr = item.args ? argsToText(item.args) : '';
+                  if (argsStr.length > MAX_TEXT) argsStr = argsStr.slice(0, MAX_TEXT) + '\n…(过长截断)';
+                  let text = item.text || '';
+                  if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + '\n…(过长截断)';
                   entries.push({
                     seq: step.seq,
                     cat,
