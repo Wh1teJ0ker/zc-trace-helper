@@ -474,11 +474,18 @@ function fmtTokens(u) {
   if (total >= 1000) return `${(total / 1000).toFixed(1)}K tok`;
   return `${total} tok`;
 }
-// 高亮：接受 matchers（{w,re}）或纯词数组
+// 高亮：接受纯词数组、matchers（{w,re}）或分组 matchers（[[{w,re}],…]），统一摊平
 function highlight(textHtml, matchersOrWords) {
-  if (!matchersOrWords.length) return textHtml;
+  if (!matchersOrWords || !matchersOrWords.length) return textHtml;
+  const words = new Set();
+  const add = (x) => {
+    if (!x) return;
+    if (typeof x === 'string') { words.add(x); return; }
+    if (Array.isArray(x)) { x.forEach(add); return; }
+    if (x.w) words.add(x.w);
+  };
+  matchersOrWords.forEach(add);
   let out = textHtml;
-  const words = matchersOrWords.map(x => (typeof x === 'string' ? x : x.w));
   for (const w of words) {
     out = out.replace(new RegExp(escapeReg(escapeHtml(w)), 'gi'), (m) => `<mark>${m}</mark>`);
   }
