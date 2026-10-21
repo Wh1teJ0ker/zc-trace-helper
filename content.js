@@ -10,6 +10,28 @@
   const API_BASE = '/api/v1/whitehat/ai_gateway';
   const MAX_TEXT = 100000; // 单条文本上限，避免超长会话拖慢传输/存储
 
+  // 页级闸门：限制同时在途的 API 请求总数（跨所有会话共享）。
+  // 会话有大会话/小会话之分，按「会话数」限并发在混合负载下抖动；
+  // 页级闸门让每次详情会话（1~N 页）自动分摊带宽。
+  let pageLimit = 8;
+  let pageInFlight = 0;
+  let pagesDone = 0;       // 累计完成的页请求数（AIMD 观测用）
+  let pageErrs = 0;        // 累计失败的页请求数
+  const pageWaiters = [];
+  function setMaxConcurrentPages(n) {
+    pageLimit = Math.max(1, Math.min(48, Math.round(n)));
+  }
+  async function acquirePageSlot() {
+    if (pageInFlight < pageLimit) { pageInFlight++; return; }
+    await new Promise((resolve) => pageWaiters.push(resolve));
+    pageInFlight++;
+  }
+  function releasePageSlot() {
+    pageInFlight--;
+    const w = pageWaiters.shift();
+    if (w) w();
+  }
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function getToken() {
@@ -22,6 +44,20 @@
   }
 
   async function apiPost(path, body) {
+    await acquirePageSlot();
+    try {
+      const out = await doApiPost(path, body);
+      pagesDone++;
+      return out;
+    } catch (e) {
+      pageErrs++;
+      throw e;
+    } finally {
+      releasePageSlot();
+    }
+  }
+
+  async function doApiPost(path, body) {
     const token = getToken();
     if (!token) throw new Error('未取到登录 token（请确认已登录）');
     const resp = await fetch(`${API_BASE}/${path}`, {
@@ -49,6 +85,13 @@
           case 'PING':
             sendResponse({ ok: true, page: detectPage() });
             return;
+          case 'SET_PAGE_LIMIT':
+            setMaxConcurrentPages(msg.limit || 8);
+            sendResponse({ ok: true, limit: pageLimit });
+            return;
+          case 'GET_PAGE_STATS':
+            sendResponse({ ok: true, limit: pageLimit, inFlight: pageInFlight, pagesDone, pageErrs });
+            return;
           case 'FETCH_SESSIONS': {
             const data = await apiPost('sessions', {
               project_code: PROJECT_CODE,
@@ -59,8 +102,7 @@
             return;
           }
           case 'FETCH_DETAIL': {
-            // 首页 + 预取页并行；剩余页再分批并行（page_size=100 为上限）
-            const PAGE_CONC = 24; // 单会话同时在途的翻页请求上限（大分页会话不被拆成太多串行批次）
+            // 所有页（含首页）并发发起，由页级闸门统一限流；缺哪页补哪页
             const fetchPage = (p) =>
               apiPost('session_detail', {
                 project_code: PROJECT_CODE,
@@ -69,7 +111,7 @@
                 page_size: 100,
               });
 
-            const prePages = Math.max(1, Math.min(Number(msg.prePages) || 1, 8));
+            const prePages = Math.max(1, Math.min(Number(msg.prePages) || 1, 6));
             const pre = await Promise.all(
               Array.from({ length: prePages }, (_, i) => fetchPage(i + 1).catch(() => null)),
             );
@@ -82,13 +124,11 @@
             // 缺哪页补哪页：预取失败的页、超出预取范围的页都在这里补
             const missing = [];
             for (let p = 1; p <= totalPages; p++) if (!pageSteps.has(p)) missing.push(p);
-            for (let i = 0; i < missing.length; i += PAGE_CONC) {
-              const batch = missing.slice(i, i + PAGE_CONC);
-              const res = await Promise.all(
-                batch.map((q) => fetchPage(q).then((r) => r.steps || []).catch(() => [])),
-              );
-              batch.forEach((q, j) => pageSteps.set(q, res[j]));
-            }
+            await Promise.all(
+              missing.map((q) =>
+                fetchPage(q).then((r) => pageSteps.set(q, r.steps || [])).catch(() => pageSteps.set(q, [])),
+              ),
+            );
             const entries = [];
             let stepCount = 0;
             for (let p = 1; p <= totalPages; p++) {
