@@ -59,31 +59,41 @@
             return;
           }
           case 'FETCH_DETAIL': {
-            // 首页拿分页信息，其余页并行拉取（page_size=100 为上限）
-            const first = await apiPost('session_detail', {
-              project_code: PROJECT_CODE,
-              session_id: msg.sessionId,
-              page: 1,
-              page_size: 100,
+            // 首页 + 预取页并行；剩余页再分批并行（page_size=100 为上限）
+            const PAGE_CONC = 10; // 单会话同时在途的翻页请求上限
+            const fetchPage = (p) =>
+              apiPost('session_detail', {
+                project_code: PROJECT_CODE,
+                session_id: msg.sessionId,
+                page: p,
+                page_size: 100,
+              });
+
+            const prePages = Math.max(1, Math.min(Number(msg.prePages) || 1, 8));
+            const pre = await Promise.all(
+              Array.from({ length: prePages }, (_, i) => fetchPage(i + 1).catch(() => null)),
+            );
+            if (!pre[0]) throw new Error('会话详情首页拉取失败');
+            const totalPages = pre[0].pagination?.total_pages || 1;
+            const pageSteps = new Map();
+            pre.forEach((r, i) => {
+              if (r) pageSteps.set(i + 1, r.steps || []);
             });
-            const session = first.session || null;
-            const totalPages = first.pagination?.total_pages || 1;
-            const pages = [first.steps || []];
-            if (totalPages > 1) {
-              const rest = await Promise.all(
-                Array.from({ length: totalPages - 1 }, (_, i) =>
-                  apiPost('session_detail', {
-                    project_code: PROJECT_CODE,
-                    session_id: msg.sessionId,
-                    page: i + 2,
-                    page_size: 100,
-                  }).catch(() => ({ steps: [] })),
-                ),
+            // 缺哪页补哪页：预取失败的页、超出预取范围的页都在这里补
+            const missing = [];
+            for (let p = 1; p <= totalPages; p++) if (!pageSteps.has(p)) missing.push(p);
+            for (let i = 0; i < missing.length; i += PAGE_CONC) {
+              const batch = missing.slice(i, i + PAGE_CONC);
+              const res = await Promise.all(
+                batch.map((q) => fetchPage(q).then((r) => r.steps || []).catch(() => [])),
               );
-              for (const r of rest) pages.push(r.steps || []);
+              batch.forEach((q, j) => pageSteps.set(q, res[j]));
             }
             const entries = [];
-            for (const steps of pages) {
+            let stepCount = 0;
+            for (let p = 1; p <= totalPages; p++) {
+              const steps = pageSteps.get(p) || [];
+              stepCount += steps.length;
               for (const step of steps) {
                 for (const item of step.items || []) {
                   if (!item.text && !(item.args && Object.keys(item.args).length)) continue;
@@ -105,7 +115,7 @@
                 }
               }
             }
-            sendResponse({ ok: true, session, entries });
+            sendResponse({ ok: true, session: pre[0].session || null, entries, totalPages, stepCount });
             return;
           }
           case 'FILL_SUBSTEP': {

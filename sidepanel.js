@@ -3,7 +3,7 @@
  *   zcth:sessions  = { sid: 平台会话对象(不含 detail) }   列表元数据，一次写
  *   zcth:detail:<sid> = { entries: [...], n: 条数 }        每会话一条详情索引，独立写
  * - 首次抓取全量；之后增量（列表从第 1 页翻到已知 sid 即停）
- * - 索引并发 16；详情多页在 content script 内并行；详情写入攒批落盘
+ * - 索引并发 32；按事件数预取详情分页（省一次串行往返）；详情写入攒批落盘
  * - 打开面板只读缓存渲染，不自动重拉详情
  */
 
@@ -25,9 +25,10 @@ const statHits = $('#statHits');
 const catGroup = $('#catGroup');
 
 const PAGE_SIZE = 100;
-const IDX_CONCURRENCY = 16;      // 索引并发：16 条会话同时拉详情
+const IDX_CONCURRENCY = 32;      // 索引并发：32 条会话同时拉详情
 const DETAIL_WRITE_BATCH = 16;   // 详情落盘批大小
 const DETAIL_WRITE_DELAY = 400;  // 或最长 400ms 落一次盘
+let stepsPerEvent = 0.5;         // 学习值：每 1 个 event 约等于多少 step，用于预取页数估算
 const KEY_SESSIONS = 'zcth:sessions';
 const KEY_DETAIL = (sid) => `zcth:detail:${sid}`;
 
@@ -242,11 +243,22 @@ async function buildIndex() {
   const startedAt = Date.now();
 
   const fetchOne = async (sid) => {
+    const meta = sessions.get(sid) || {};
+    const ev = Number(meta.event_count ?? meta.range_call_count ?? 0) || 0;
+    // 按学习到的 step/event 比例估算总页数，首页与后续页并行预取，省掉一次串行往返
+    const estPages = ev > 0
+      ? Math.max(1, Math.min(Math.ceil((ev * stepsPerEvent) / PAGE_SIZE), 8))
+      : 1;
+
     let lastErr = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const resp = await sendToContent({ type: 'FETCH_DETAIL', sessionId: Number(sid) });
+        const resp = await sendToContent({ type: 'FETCH_DETAIL', sessionId: Number(sid), prePages: estPages });
         if (!resp.ok) throw new Error(resp.error || '详情失败');
+        if (resp.stepCount > 0 && ev > 0) {
+          const observed = resp.stepCount / ev;
+          stepsPerEvent = Math.max(0.05, Math.min(3, stepsPerEvent * 0.6 + observed * 0.4));
+        }
         return resp;
       } catch (e) {
         lastErr = e;
@@ -371,8 +383,22 @@ function buildMatchers(groups) {
   return groups.map(g => g.map(w => ({ w, re: new RegExp(escapeReg(w), 'i') })));
 }
 
-function entryHay(e) {
-  return (e.args ? e.args + '\n' : '') + (e.text || '') + (e.tool ? '\n' + e.tool : '');
+// 条目内匹配：逐字段 test，避免为每条目拼接大字符串（3638 条会话时节省大量分配）
+function termInEntry(t, e) {
+  if (e.args && t.re.test(e.args)) return true;
+  if (e.text && t.re.test(e.text)) return true;
+  if (e.tool && t.re.test(e.tool)) return true;
+  return false;
+}
+function anyTermInEntry(e, matchers) {
+  for (const g of matchers) {
+    let all = true;
+    for (const t of g) {
+      if (!termInEntry(t, e)) { all = false; break; }
+    }
+    if (all) return true;
+  }
+  return false;
 }
 function anyTermIn(hay, matchers) {
   for (const g of matchers) {
@@ -395,7 +421,7 @@ function matchItem(sid, item, matchers, catKeys) {
   const only = catKeys.length ? new Set(catKeys) : null;
   for (const e of d.entries) {
     if (only && !only.has(e.cat)) continue;
-    if (anyTermIn(entryHay(e), matchers)) return true;
+    if (anyTermInEntry(e, matchers)) return true;
   }
   return false;
 }
@@ -414,7 +440,7 @@ function hitCats(sid, item, matchers, catKeys) {
   for (const e of d.entries) {
     if (only && !only.has(e.cat)) continue;
     if (out.has(e.cat)) continue;
-    if (anyTermIn(entryHay(e), matchers)) out.add(e.cat);
+    if (anyTermInEntry(e, matchers)) out.add(e.cat);
   }
   return [...out];
 }
@@ -497,19 +523,10 @@ function currentFilter() {
   return chip ? chip.dataset.f : 'all';
 }
 
-function updateStats() {
+function updateStats(hits, hasKw) {
   statTotal.textContent = sessions.size || '–';
   statIndexed.textContent = sessions.size ? details.size : '–';
-  const kw = searchInput.value.trim();
-  if (kw && sessions.size) {
-    const matchers = buildMatchers(parseQuery(kw));
-    const cats = currentCatKeys();
-    let hits = 0;
-    for (const [sid, it] of sessions) if (matchItem(sid, it, matchers, cats)) hits++;
-    statHits.textContent = hits;
-  } else {
-    statHits.textContent = '–';
-  }
+  statHits.textContent = hasKw ? hits : '–';
 }
 
 /* 分块渲染：一次最多画 RENDER_CHUNK 张卡片，避免数百卡片一次性建 DOM */
@@ -526,21 +543,22 @@ function renderList() {
 
   let list = [...sessions.entries()].map(([sid, it]) => ({ sid, ...it }));
   if (hasKw) list = list.filter(it => matchItem(it.sid, it, matchers, cats));
+  const hits = hasKw ? list.length : 0;
   if (filter === 'checked') list = list.filter(it => checkedOrder.includes(it.sid));
   sortItems(list);
 
-  countInfo.innerHTML = hasKw ? `命中 <b>${list.length}</b> / ${sessions.size}` : `${list.length} 条`;
+  countInfo.innerHTML = hasKw ? `命中 <b>${hits}</b> / ${sessions.size}` : `${list.length} 条`;
 
   if (!list.length) {
     listEl.innerHTML = `<div class="empty">${hasKw ? ICON_SEARCH_BIG : ICON_EMPTY_WIFI}${hasKw ? '没有命中的会话——试试别的关键词/类目，或先「增量抓取」' : '点击「抓取全部」开始'}</div>`;
-    updateStats();
+    updateStats(hits, hasKw);
     return;
   }
 
   listEl.innerHTML = '';
   renderState = { list, rendered: 0, matchers, hasKw };
   appendChunk();
-  updateStats();
+  updateStats(hits, hasKw);
 }
 
 function appendChunk() {
@@ -781,7 +799,7 @@ function renderViewer() {
   let list = viewerEntries;
   if (viewerCats.size) list = list.filter(e => viewerCats.has(e.cat));
   if (matchers.length) {
-    list = list.filter(e => anyTermIn(entryHay(e), matchers));
+    list = list.filter(e => anyTermInEntry(e, matchers));
   }
 
   if (!list.length) {
