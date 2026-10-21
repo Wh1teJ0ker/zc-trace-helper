@@ -94,6 +94,7 @@ async function saveDetailKeys(keys) {
 // 索引期间的详情写入先入队，攒批落盘，避免每会话一次 storage IPC
 const pendingDetails = new Map();
 let detailFlushTimer = null;
+let lastKeysSaveAt = 0;
 function queueDetailSave(sid, detail) {
   pendingDetails.set(KEY_DETAIL(sid), detail);
   if (pendingDetails.size >= DETAIL_WRITE_BATCH) { flushDetailWrites(); return; }
@@ -105,6 +106,11 @@ async function flushDetailWrites() {
   if (!pendingDetails.size) return;
   const obj = Object.fromEntries(pendingDetails);
   pendingDetails.clear();
+  // 顺带记录已索引的键（最多 2 秒一次）：中途关闭面板/重载插件后能接着跑，不重拉
+  if (Date.now() - lastKeysSaveAt > 2000) {
+    obj['zcth:detailKeys'] = [...details.keys()];
+    lastKeysSaveAt = Date.now();
+  }
   await safeSet(obj);
 }
 window.addEventListener('pagehide', () => { flushDetailWrites(); });
@@ -113,11 +119,22 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function loadStore() {
-  const { [KEY_SESSIONS]: stored, lastCrawlAt: lca, 'zcth:detailKeys': dkeys } = await chrome.storage.local.get([KEY_SESSIONS, 'lastCrawlAt', 'zcth:detailKeys']);
+  const { [KEY_SESSIONS]: stored, lastCrawlAt: lca, 'zcth:detailKeys': savedKeys } = await chrome.storage.local.get([KEY_SESSIONS, 'lastCrawlAt', 'zcth:detailKeys']);
   sessions = new Map(Object.entries(stored || {}));
   lastCrawlAt = lca || 0;
   details = new Map();
-  if (Array.isArray(dkeys) && dkeys.length) {
+
+  // 详情键以存储中的实际键为准（getKeys 只取键名，不会把全部数据读进内存）；
+  // 老版本 Chrome 没有 getKeys 时退回 zcth:detailKeys 记录
+  const prefix = 'zcth:detail:';
+  let dkeys = Array.isArray(savedKeys) ? savedKeys.slice() : [];
+  if (typeof chrome.storage.local.getKeys === 'function') {
+    try {
+      const allKeys = await chrome.storage.local.getKeys();
+      dkeys = allKeys.filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length));
+    } catch {}
+  }
+  if (dkeys.length) {
     const keys = dkeys.map(sid => KEY_DETAIL(sid));
     const chunk = 64;
     const chunks = [];
@@ -127,7 +144,7 @@ async function loadStore() {
       const parts = await Promise.all(chunks.slice(i, i + 8).map(c => chrome.storage.local.get(c)));
       for (const part of parts) {
         for (const [k, v] of Object.entries(part)) {
-          const sid = k.replace('zcth:detail:', '');
+          const sid = k.replace(prefix, '');
           if (v && v.entries) details.set(sid, v);
         }
       }
@@ -320,7 +337,7 @@ async function buildIndex() {
         active--;
       }
       done++;
-      if (done % 5 === 0 || done === total) {
+      if (done === 1 || done % 5 === 0 || done === total) {
         const sec = Math.max((Date.now() - startedAt) / 1000, 0.001);
         const perSec = done / sec;
         const remain = total - done;
@@ -396,6 +413,8 @@ async function rebuildIndex() {
         await chrome.storage.local.remove(removeKeys.slice(i, i + 64));
       }
     }
+    // 重建走的是老版本的 detailKeys 记录，也一并清空，避免下次启动读到已删除的键
+    await safeSet({ 'zcth:detailKeys': [] });
     const r = await buildIndex();
     setStatus(`索引重建完成：${r.total} 条${r.errs.length ? `（失败 ${r.errs.length}）` : ''}`, r.errs.length ? 'err' : 'ok');
     renderList();
